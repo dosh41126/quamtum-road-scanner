@@ -1,16 +1,4 @@
-"""
-Quantum Road Scanner (QRS) v2.4
-───────────────────────────────────────────────────────────────────────────────
-• Async-safe rate-limiter (asyncio.Lock)
-• Proper Hadamard gates per wire
-• GPU AES stub returns bytes
-• Guaranteed camera release on error
-• ENV-var fallback for OpenAI key
-───────────────────────────────────────────────────────────────────────────────
-pip install aiohttp httpx psutil pennylane opencv-python pillow numpy aiosqlite
-"""
 from __future__ import annotations
-
 # ─── Stdlib ───────────────────────────────────────────────────────────────────
 import asyncio
 import json
@@ -20,7 +8,6 @@ import secrets
 import threading
 import time
 from base64 import b64decode, b64encode
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Final, List, Optional
 
@@ -36,16 +23,10 @@ import cv2
 import pennylane as qml
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-try:
-    import cupy as cp  # GPU AES placeholder
-    GPU_AVAILABLE = True
-except Exception:
-    GPU_AVAILABLE = False
-
 # ─── Config ───────────────────────────────────────────────────────────────────
 CROP_TOP, CROP_BOTTOM = 0.6, 0.9
 CROP_LEFT, CROP_RIGHT = 0.3, 0.7
-GPT_VECTOR_TEMPERATURE:  Final = 0.4
+GPT_VECTOR_TEMPERATURE: Final = 0.4
 GPT_COMPLETION_TEMPERATURE: Final = 0.6
 PROMPT_WORD_LIMIT: Final = 300
 OPENAI_TIMEOUT: Final = 20
@@ -60,10 +41,9 @@ _rate_lock = asyncio.Lock()
 _last_call: float = 0.0
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Crypto
+# AES-GCM Encryption
 # ═════════════════════════════════════════════════════════════════════════════
 class AESGCMCrypto:
-    """File-backed AES-128-GCM helper."""
     def __init__(self, key_path: str = "~/.cache/qrs_master_key.bin") -> None:
         self.key_path = os.path.expanduser(key_path)
         if not os.path.exists(self.key_path):
@@ -88,27 +68,19 @@ class AESGCMCrypto:
         raw = b64decode(token)
         return self._aes.decrypt(raw[:12], raw[12:], None).decode()
 
-def gpu_encrypt(data: bytes) -> bytes:
-    """Future hook: off-load to GPU when cupy is present."""
-    if not GPU_AVAILABLE or not data:
-        return data
-    buf = cp.asarray(memoryview(data))
-    return bytes(cp.asnumpy(buf))
-
 crypto = AESGCMCrypto()
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Helpers
+# Helper Functions
 # ═════════════════════════════════════════════════════════════════════════════
 def get_cpu_usage() -> float:
-    try:  # psutil is non-blocking here
+    try:
         return psutil.cpu_percent(interval=None)
     except Exception as exc:
         logging.error("CPU usage fetch error: %s", exc)
         return 0.0
 
 class VideoCaptureCtx:
-    """Context-managed cv2.VideoCapture for safe release."""
     def __init__(self, index: int = 0) -> None:
         self._cap = cv2.VideoCapture(index, cv2.CAP_ANY)
 
@@ -132,7 +104,7 @@ def camera_color_vector() -> List[int]:
     return [r, g, b]
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Networking helpers
+# Networking
 # ═════════════════════════════════════════════════════════════════════════════
 async def _rate_limited_post(url: str, headers: dict, payload: dict) -> dict:
     global _last_call
@@ -148,8 +120,7 @@ async def _rate_limited_post(url: str, headers: dict, payload: dict) -> dict:
     return resp.json()
 
 async def gpt_color_vector(api_key: str) -> List[int]:
-    prompt = ("Return ONLY a Python list of three integers (0-255) "
-              "representing the average road-surface RGB color.")
+    prompt = "Return ONLY a Python list of three integers (0-255) representing the average road-surface RGB color."
     payload = {
         "model": "gpt-4o",
         "messages": [{"role": "user", "content": prompt}],
@@ -162,15 +133,9 @@ async def gpt_color_vector(api_key: str) -> List[int]:
              "Content-Type": "application/json"},
             payload)
         content = data["choices"][0]["message"]["content"].strip()
-        # Robust parse
-        for parser in (json.loads, lambda s: eval(s, {})):
-            try:
-                return list(map(int, parser(content)))
-            except Exception:
-                pass
-        raise ValueError("Un-parseable GPT vector.")
-    except Exception as exc:
-        logging.error("GPT color vector error: %s", exc)
+        return list(map(int, json.loads(content)))
+    except Exception as e:
+        logging.error("GPT color vector error: %s", e)
         return [128, 128, 128]
 
 async def run_openai_completion(prompt: str, api_key: str) -> str:
@@ -186,12 +151,12 @@ async def run_openai_completion(prompt: str, api_key: str) -> str:
              "Content-Type": "application/json"},
             payload)
         return data["choices"][0]["message"]["content"].strip()
-    except Exception as exc:
-        logging.error("OpenAI completion error: %s", exc)
+    except Exception as e:
+        logging.error("OpenAI completion error: %s", e)
         return "Error: Unable to retrieve completion."
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Quantum
+# Quantum Logic
 # ═════════════════════════════════════════════════════════════════════════════
 dev = qml.device("default.qubit", wires=3)
 
@@ -217,7 +182,7 @@ def quantum_rgb(cpu_pct: float, rgb: List[int]) -> List[float]:
     return _quantum_rgb_circuit_node(r, g, b, c).tolist()
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Database
+# SQLite Logging via aiosqlite
 # ═════════════════════════════════════════════════════════════════════════════
 DB_PATH = "qrs_db.db"
 CREATE_SQL = """
@@ -241,17 +206,16 @@ async def init_db() -> None:
         await db.commit()
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Core engine
+# Core Scan Function
 # ═════════════════════════════════════════════════════════════════════════════
-async def scan_and_log(api_key: str, vehicle: str, route_task: str,
-                       use_camera: bool) -> str:
+async def scan_and_log(api_key: str, vehicle: str, route_task: str, use_camera: bool) -> str:
     await init_db()
 
     cpu = get_cpu_usage()
     try:
         rgb = camera_color_vector() if use_camera else await gpt_color_vector(api_key)
-    except Exception as exc:
-        logging.warning("Camera failure (%s); using GPT fallback.", exc)
+    except Exception as e:
+        logging.warning("Camera failed (%s); fallback to GPT", e)
         rgb = await gpt_color_vector(api_key)
 
     probs = quantum_rgb(cpu, rgb)
@@ -279,7 +243,6 @@ Limit to ≤ {PROMPT_WORD_LIMIT} words.
 """.strip()
 
     response = await run_openai_completion(prompt, api_key)
-
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
     async with qrsdb.connect(DB_PATH) as db:
         await db.execute(
@@ -300,34 +263,28 @@ Limit to ≤ {PROMPT_WORD_LIMIT} words.
     return response
 
 # ═════════════════════════════════════════════════════════════════════════════
-# GUI
+# GUI (Tkinter)
 # ═════════════════════════════════════════════════════════════════════════════
 class QRSScannerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Quantum Road Scanner (QRS v2.4)")
-        self.geometry("820x720")
+        self.geometry("800x700")
 
-        tk.Label(self, text="Quantum Road Scanner",
-                 font=("Helvetica", 18, "bold")).pack(pady=8)
+        tk.Label(self, text="Quantum Road Scanner", font=("Helvetica", 18, "bold")).pack(pady=8)
 
         frm = tk.Frame(self); frm.pack(pady=4)
-
         tk.Label(frm, text="Vehicle Type:").grid(row=0, column=0, sticky="e")
         self.vehicle = tk.StringVar(value="motorcycle")
-        tk.OptionMenu(frm, self.vehicle,
-                      "motorcycle", "car", "truck", "bicycle").grid(row=0, column=1)
+        tk.OptionMenu(frm, self.vehicle, "motorcycle", "car", "truck", "bicycle").grid(row=0, column=1)
 
         tk.Label(frm, text="Destination / Task:").grid(row=1, column=0, sticky="e")
-        self.route = tk.Entry(frm, width=48)
-        self.route.grid(row=1, column=1, pady=3)
+        self.route = tk.Entry(frm, width=48); self.route.grid(row=1, column=1, pady=3)
 
         self.cam_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(frm, text="Use camera for RGB",
-                       variable=self.cam_var).grid(row=2, column=1, sticky="w")
+        tk.Checkbutton(frm, text="Use camera for RGB", variable=self.cam_var).grid(row=2, column=1, sticky="w")
 
-        self.start_btn = tk.Button(self, text="Start Scan",
-                                   font=("Helvetica", 14), command=self.start_scan)
+        self.start_btn = tk.Button(self, text="Start Scan", font=("Helvetica", 14), command=self.start_scan)
         self.start_btn.pack(pady=8)
 
         self.status = tk.StringVar(value="Idle.")
@@ -342,10 +299,8 @@ class QRSScannerApp(tk.Tk):
 
         self.api_key_path = "~/.cache/qrs_encrypted_api_key.bin"
 
-    # ─── API key ──────────────────────────────────────────────────────────────
     def prompt_api_key(self) -> None:
-        key = simpledialog.askstring("API Key",
-                                     "Enter your OpenAI API Key:", show='*')
+        key = simpledialog.askstring("API Key", "Enter your OpenAI API Key:", show='*')
         if key:
             with open(os.path.expanduser(self.api_key_path), "wb") as f:
                 f.write(crypto.encrypt(key))
@@ -358,7 +313,6 @@ class QRSScannerApp(tk.Tk):
         except Exception:
             return os.getenv("OPENAI_API_KEY")
 
-    # ─── Scan ────────────────────────────────────────────────────────────────
     def start_scan(self) -> None:
         api = self.load_api_key()
         if not api:
@@ -370,30 +324,25 @@ class QRSScannerApp(tk.Tk):
 
         threading.Thread(
             target=self._thread_worker,
-            args=(api, self.vehicle.get(),
-                  self.route.get().strip() or "unspecified",
-                  self.cam_var.get()),
+            args=(api, self.vehicle.get(), self.route.get().strip() or "unspecified", self.cam_var.get()),
             daemon=True
         ).start()
 
-    def _thread_worker(self, api: str, vehicle: str,
-                       route_task: str, use_cam: bool) -> None:
+    def _thread_worker(self, api: str, vehicle: str, route_task: str, use_cam: bool) -> None:
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            result = loop.run_until_complete(
-                scan_and_log(api, vehicle, route_task, use_cam))
+            result = loop.run_until_complete(scan_and_log(api, vehicle, route_task, use_cam))
             self.after(0, lambda: self._update_ui(result))
-        except Exception as exc:
-            logging.exception(exc)
-            self.after(0, lambda: messagebox.showerror("Error", str(exc)))
+        except Exception as e:
+            logging.exception(e)
+            self.after(0, lambda: messagebox.showerror("Error", str(e)))
         finally:
             self.after(0, self._reset_ui)
 
     def _update_ui(self, text: str) -> None:
         ts_local = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        self.result_text.insert(
-            tk.END, f"\n─── Scan Result ({ts_local}) ───\n{text}\n")
+        self.result_text.insert(tk.END, f"\n─── Scan Result ({ts_local}) ───\n{text}\n")
         self.result_text.see(tk.END)
 
     def _reset_ui(self) -> None:

@@ -1,0 +1,8 @@
+aiohttp
+httpx
+psutil
+pennylane
+opencv-python
+numpy
+cryptography
+aiosqlite
